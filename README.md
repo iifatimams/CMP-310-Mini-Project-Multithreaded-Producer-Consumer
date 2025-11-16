@@ -40,7 +40,8 @@ The program requires three command-line arguments:
 - Each producer generates 20 items  
 - Total real items = 3 × 20 = 60
 
-![Running the Application](./3.png)
+![Running the Application](./producer_consumer%203%202%2010%20input.png)
+
 
 ---
 
@@ -149,17 +150,12 @@ Runtime: 0.002 seconds
 
 This confirms correct synchronization, priority handling, poison-pill shutdown, and metric computation.
 
-![Full Example Output](./33.png)
+![Full Example Output](./producer_consumer%203%202%2010.png)
 
----
-
-## License
-
-This project is part of CMP 310 coursework. Educational use only.
 
 ---
 
 ## Author
 
-Developed by: [Your Name]  
+Developed by: Fatima Mohammed S Al Sinan - g00097019
 Course: CMP 310 – Operating Systems
