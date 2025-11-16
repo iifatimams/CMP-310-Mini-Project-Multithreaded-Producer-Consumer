@@ -133,6 +133,7 @@ static buffer_item_t dequeue_item(void)
 }
 
 // Producer thread function
+// Producer thread function
 void *producer_thread(void *arg)
 {
     thread_arg_t *targ = (thread_arg_t *)arg;
@@ -156,22 +157,23 @@ void *producer_thread(void *arg)
             item.priority = PRIORITY_NORMAL;
         }
 
-        // Record enqueue time when the producer starts the enqueue operation.
-        // This includes any waiting time if the buffer is full.
-        if (clock_gettime(CLOCK_MONOTONIC, &item.enq_time) == -1) {
-            die("clock_gettime in producer");
-        }
-
-        // Waits for an empty slot in the buffer (may block when full)
+        // Wait for an empty slot in the buffer (may block when full)
         if (sem_wait(sem_empty) == -1) {
             die("sem_wait(sem_empty) in producer");
         }
 
-        // Inserts the item into the appropriate queue
+        // Lock the buffer to insert the item safely
         if (pthread_mutex_lock(&buffer_mutex) != 0) {
             die("pthread_mutex_lock buffer_mutex in producer");
         }
 
+        // Record enqueue time when the producer actually inserts the item
+        //    This matches the requirement: timestamp at insertion into the buffer.
+        if (clock_gettime(CLOCK_MONOTONIC, &item.enq_time) == -1) {
+            die("clock_gettime in producer");
+        }
+
+        // Insert the item into the appropriate queue
         enqueue_item(&item);
 
         // Prints producer message
@@ -184,7 +186,7 @@ void *producer_thread(void *arg)
             die("pthread_mutex_unlock buffer_mutex in producer");
         }
 
-        // Signals that there is at least one full slot
+        // 5) Signal that there is at least one full slot
         if (sem_post(sem_full) == -1) {
             die("sem_post(sem_full) in producer");
         }
