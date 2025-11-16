@@ -1,322 +1,454 @@
-// CMP-310 Mini Project – Producer–Consumer (Fall 2025)
-// Multithreaded bounded buffer using pthreads, semaphores, and a mutex.
-// Compatible with macOS (uses named semaphores) and Linux.
+// producer_consumer.c
+// -----------------------------------------------------------------------------
+
+
+
+#define _POSIX_C_SOURCE 200809L
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <pthread.h>
 #include <semaphore.h>
+#include <fcntl.h>      // O_CREAT, O_EXCL
+#include <sys/stat.h>   // mode constants
 #include <time.h>
-#include <sys/time.h>
-#include <fcntl.h>     // For O_CREAT, O_EXCL
-#include <sys/stat.h>  // For mode constants
+#include <errno.h>
+#include <string.h>
+#include <stdint.h>
 #include <unistd.h>
 
-#define POISON_PILL -1
+// Named semaphore identifiers
+#define EMPTY_SEM_NAME "/pc_empty_sem_example"
+#define FULL_SEM_NAME  "/pc_full_sem_example"
 
-// Names for POSIX named semaphores
-#define EMPTY_SEM_NAME "/cmp310_empty_slots"
-#define FULL_SEM_NAME  "/cmp310_full_slots"
+// Priority values
+#define PRIORITY_NORMAL 0
+#define PRIORITY_URGENT 1
 
-// Each buffer slot stores a value and its enqueue time
+// Percentage of urgent items (at least 25% as required)
+#define URGENT_PERCENT 25
+
+// Special poison-pill marker
+#define POISON_VALUE   -1
+
+// Structure that represents a single item in the buffer
 typedef struct {
-    int value;
-    struct timeval enqueue_time;
-} buffer_slot_t;
+    int value;                  // The integer payload
+    int priority;               // 0 = normal, 1 = urgent
+    int is_poison;              // 1 if this is a poison pill, 0 otherwise
+    struct timespec enq_time;   // Timestamp when producer enqueues the item
+} buffer_item_t;
 
-// Shared structure holding buffer state and synchronization primitives
+// Global configuration parameters
+int NUM_PRODUCERS = 0;
+int NUM_CONSUMERS = 0;
+int BUFFER_SIZE   = 0;
+int ITEMS_PER_PRODUCER = 0;
+
+// Global shared queues for priorities (each is circular)
+buffer_item_t *urgent_queue  = NULL;
+buffer_item_t *normal_queue  = NULL;
+
+int urgent_head  = 0, urgent_tail  = 0, urgent_count  = 0;
+int normal_head  = 0, normal_tail  = 0, normal_count  = 0;
+
+// Synchronization primitives
+sem_t *sem_empty = NULL;    // Counts free slots in the whole buffer
+sem_t *sem_full  = NULL;    // Counts filled slots (any priority)
+pthread_mutex_t buffer_mutex   = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t metrics_mutex  = PTHREAD_MUTEX_INITIALIZER;
+
+// Metrics
+uint64_t total_latency_ns = 0;   // Sum of per-item latency in nanoseconds
+uint64_t total_items      = 0;   // Number of real (non-poison) items consumed
+
+struct timespec start_time_global;
+struct timespec end_time_global;
+
+// Structure passed to each thread
 typedef struct {
-    buffer_slot_t *buffer;   // Circular buffer storage
-    int size;                // Capacity of the buffer
-    int in;                  // Write index
-    int out;                 // Read index
-
-    // Named semaphores (pointers)
-    sem_t *empty_slots;      // Tracks remaining empty positions
-    sem_t *full_slots;       // Tracks filled positions available for consumption
-
-    pthread_mutex_t mutex;   // Ensures mutual exclusion on buffer access
-
-    int producers;
-    int consumers;
-    int items_per_producer;
-
-    int total_items;         // Expected number of real items
-    int consumed_items;      // Number of consumed real items
-
-    double total_latency_sec; // Sum of per-item latency in seconds
-
-    pthread_mutex_t stats_mutex; // Protects consumed_items and total_latency_sec
-    pthread_cond_t  all_items_consumed; // Signaled when all real items consumed
-
-    struct timeval start_time; // Time when program started work
-    struct timeval end_time;   // Time when all consumers finished
-} shared_t;
-
-typedef struct {
-    int id;          // Thread ID for logging
-    shared_t *shared;
+    int thread_id;   // 1-based index
 } thread_arg_t;
 
+// Utility function: converts timespec difference to nanoseconds
+static uint64_t diff_timespec_ns(const struct timespec *start,
+                                 const struct timespec *end)
+{
+    int64_t sec  = (int64_t)end->tv_sec  - (int64_t)start->tv_sec;
+    int64_t nsec = (int64_t)end->tv_nsec - (int64_t)start->tv_nsec;
 
-// Returns current wall-clock time (helper)
-static inline void now(struct timeval *tv) {
-    gettimeofday(tv, NULL);
+    if (nsec < 0) {
+        sec--;
+        nsec += 1000000000LL;
+    }
+    return (uint64_t)sec * 1000000000ULL + (uint64_t)nsec;
 }
 
-// Producer: generates items and inserts them into the circular buffer
-void *producer_thread(void *arg) {
-    thread_arg_t *t = (thread_arg_t *)arg;
-    shared_t *s = t->shared;
+// Utility: safe exit with message
+static void die(const char *msg)
+{
+    perror(msg);
+    exit(EXIT_FAILURE);
+}
 
-    for (int i = 0; i < s->items_per_producer; i++) {
-        int item = rand() % 1000;
+// Function that enqueues an item into the appropriate priority queue
+static void enqueue_item(const buffer_item_t *item)
+{
+    // The caller already holds buffer_mutex and has decremented sem_empty
+    if (item->priority == PRIORITY_URGENT && !item->is_poison) {
+        // Inserts into urgent queue
+        urgent_queue[urgent_tail] = *item;
+        urgent_tail = (urgent_tail + 1) % BUFFER_SIZE;
+        urgent_count++;
+    } else {
+        // Inserts into normal queue (also used for poison pills)
+        normal_queue[normal_tail] = *item;
+        normal_tail = (normal_tail + 1) % BUFFER_SIZE;
+        normal_count++;
+    }
+}
 
-        sem_wait(s->empty_slots);          // Blocks if buffer is full
-        pthread_mutex_lock(&s->mutex);     // Exclusive access to buffer
+// Function that dequeues an item, giving priority to urgent items
+static buffer_item_t dequeue_item(void)
+{
+    buffer_item_t item;
 
-        struct timeval enq_time;
-        now(&enq_time);
+    // The caller already holds buffer_mutex and has decremented sem_full
+    if (urgent_count > 0) {
+        // Consumer takes from urgent queue first
+        item = urgent_queue[urgent_head];
+        urgent_head = (urgent_head + 1) % BUFFER_SIZE;
+        urgent_count--;
+    } else {
+        // If urgent queue is empty, it takes from normal queue
+        item = normal_queue[normal_head];
+        normal_head = (normal_head + 1) % BUFFER_SIZE;
+        normal_count--;
+    }
+    return item;
+}
 
-        s->buffer[s->in].value = item;
-        s->buffer[s->in].enqueue_time = enq_time;
+// Producer thread function
+void *producer_thread(void *arg)
+{
+    thread_arg_t *targ = (thread_arg_t *)arg;
+    int id = targ->thread_id;
 
-        printf("[Producer-%d] Produced %d at index %d\n", t->id, item, s->in);
+    // Each producer uses its own RNG seed
+    unsigned int seed = (unsigned int)time(NULL) ^ (unsigned int)(id * 7919);
 
-        s->in = (s->in + 1) % s->size;
+    for (int i = 0; i < ITEMS_PER_PRODUCER; ++i) {
+        buffer_item_t item;
+        item.is_poison = 0;
 
-        pthread_mutex_unlock(&s->mutex);
-        sem_post(s->full_slots);           // Signals a new filled slot
+        // Generates a random value
+        item.value = rand_r(&seed) % 1000;
+
+        // Assigns a priority: URGENT_PERCENT chance to be urgent
+        int rnd = rand_r(&seed) % 100;
+        if (rnd < URGENT_PERCENT) {
+            item.priority = PRIORITY_URGENT;
+        } else {
+            item.priority = PRIORITY_NORMAL;
+        }
+
+        // Waits for an empty slot in the buffer
+        if (sem_wait(sem_empty) == -1) {
+            die("sem_wait(sem_empty) in producer");
+        }
+
+        // Records enqueue time as soon as an empty slot is reserved
+        if (clock_gettime(CLOCK_MONOTONIC, &item.enq_time) == -1) {
+            die("clock_gettime in producer");
+        }
+
+        // Inserts the item into the appropriate queue
+        if (pthread_mutex_lock(&buffer_mutex) != 0) {
+            die("pthread_mutex_lock buffer_mutex in producer");
+        }
+
+        enqueue_item(&item);
+
+        // Prints producer message
+        printf("[Producer-%d] Produced item: %d (priority: %s)\n",
+               id,
+               item.value,
+               item.priority == PRIORITY_URGENT ? "urgent" : "normal");
+
+        if (pthread_mutex_unlock(&buffer_mutex) != 0) {
+            die("pthread_mutex_unlock buffer_mutex in producer");
+        }
+
+        // Signals that there is at least one full slot
+        if (sem_post(sem_full) == -1) {
+            die("sem_post(sem_full) in producer");
+        }
     }
 
-    printf("[Producer-%d] Finished producing.\n", t->id);
+    // Producer reports completion
+    printf("[Producer-%d] Finished producing %d items.\n", id, ITEMS_PER_PRODUCER);
     return NULL;
 }
 
-
-// Consumer: removes items from the circular buffer and processes them
-void *consumer_thread(void *arg) {
-    thread_arg_t *t = (thread_arg_t *)arg;
-    shared_t *s = t->shared;
+// Consumer thread function
+void *consumer_thread(void *arg)
+{
+    thread_arg_t *targ = (thread_arg_t *)arg;
+    int id = targ->thread_id;
 
     while (1) {
-        sem_wait(s->full_slots);           // Blocks if buffer is empty
-        pthread_mutex_lock(&s->mutex);     // Exclusive access to buffer
+        // Waits for at least one filled slot
+        if (sem_wait(sem_full) == -1) {
+            die("sem_wait(sem_full) in consumer");
+        }
 
-        buffer_slot_t slot = s->buffer[s->out];
+        // Removes an item (urgent first) under mutual exclusion
+        if (pthread_mutex_lock(&buffer_mutex) != 0) {
+            die("pthread_mutex_lock buffer_mutex in consumer");
+        }
 
-        printf("[Consumer-%d] Dequeued %d from index %d\n", t->id,
-               slot.value, s->out);
+        buffer_item_t item = dequeue_item();
 
-        s->out = (s->out + 1) % s->size;
+        if (pthread_mutex_unlock(&buffer_mutex) != 0) {
+            die("pthread_mutex_unlock buffer_mutex in consumer");
+        }
 
-        pthread_mutex_unlock(&s->mutex);
-        sem_post(s->empty_slots);          // Signals a newly freed slot
+        // Signals that a slot became empty
+        if (sem_post(sem_empty) == -1) {
+            die("sem_post(sem_empty) in consumer");
+        }
 
-        if (slot.value == POISON_PILL) {   // Poison pill triggers termination
-            printf("[Consumer-%d] Exiting.\n", t->id);
+        // Checks for poison pill
+        if (item.is_poison) {
+            printf("[Consumer-%d] Finished consuming.\n", id);
             break;
         }
 
-        struct timeval deq_time;
-        now(&deq_time);
-
-        // Compute latency for this item (in seconds)
-        double latency =
-            (double)(deq_time.tv_sec - slot.enqueue_time.tv_sec) +
-            (double)(deq_time.tv_usec - slot.enqueue_time.tv_usec) / 1e6;
-
-        pthread_mutex_lock(&s->stats_mutex);
-        s->consumed_items++;
-        s->total_latency_sec += latency;
-
-        // If this was the last real item, wake up main thread
-        if (s->consumed_items == s->total_items) {
-            pthread_cond_signal(&s->all_items_consumed);
+        // Records dequeue time and updates latency metrics
+        struct timespec deq_time;
+        if (clock_gettime(CLOCK_MONOTONIC, &deq_time) == -1) {
+            die("clock_gettime in consumer");
         }
 
-        pthread_mutex_unlock(&s->stats_mutex);
+        uint64_t latency_ns = diff_timespec_ns(&item.enq_time, &deq_time);
 
-        printf("[Consumer-%d] Consumed real item %d (latency ≈ %.6f s)\n",
-               t->id, slot.value, latency);
+        if (pthread_mutex_lock(&metrics_mutex) != 0) {
+            die("pthread_mutex_lock metrics_mutex in consumer");
+        }
+
+        total_latency_ns += latency_ns;
+        total_items++;
+
+        if (pthread_mutex_unlock(&metrics_mutex) != 0) {
+            die("pthread_mutex_unlock metrics_mutex in consumer");
+        }
+
+        // Processes the consumed item (here it simply prints it)
+        printf("[Consumer-%d] Consumed item: %d (priority: %s)\n",
+               id,
+               item.value,
+               item.priority == PRIORITY_URGENT ? "urgent" : "normal");
     }
-
     return NULL;
 }
 
+// Inserts poison pills after all producers are done
+static void insert_poison_pills(void)
+{
+    for (int i = 0; i < NUM_CONSUMERS; ++i) {
+        buffer_item_t poison;
+        poison.value     = POISON_VALUE;
+        poison.priority  = PRIORITY_NORMAL; // Poison uses normal priority
+        poison.is_poison = 1;
+        // Timestamp is irrelevant for poison; it is left uninitialized
 
-// Validates and converts command-line arguments
-int parse_int(char *arg, const char *name) {
-    int x = atoi(arg);
-    if (x <= 0) {
-        fprintf(stderr, "Invalid %s: %s (must be > 0)\n", name, arg);
-        exit(1);
+        if (sem_wait(sem_empty) == -1) {
+            die("sem_wait(sem_empty) for poison pill");
+        }
+
+        if (pthread_mutex_lock(&buffer_mutex) != 0) {
+            die("pthread_mutex_lock buffer_mutex for poison pill");
+        }
+
+        enqueue_item(&poison);
+
+        if (pthread_mutex_unlock(&buffer_mutex) != 0) {
+            die("pthread_mutex_unlock buffer_mutex for poison pill");
+        }
+
+        if (sem_post(sem_full) == -1) {
+            die("sem_post(sem_full) for poison pill");
+        }
     }
-    return x;
 }
 
+// Prints throughput and latency metrics
+static void print_metrics(void)
+{
+    uint64_t local_total_items;
+    uint64_t local_total_latency_ns;
 
-// Computes difference in seconds between two timevals
-double elapsed_sec(struct timeval start, struct timeval end) {
-    return (double)(end.tv_sec - start.tv_sec) +
-           (double)(end.tv_usec - start.tv_usec) / 1e6;
+    if (pthread_mutex_lock(&metrics_mutex) != 0) {
+        die("pthread_mutex_lock metrics_mutex in print_metrics");
+    }
+
+    local_total_items = total_items;
+    local_total_latency_ns = total_latency_ns;
+
+    if (pthread_mutex_unlock(&metrics_mutex) != 0) {
+        die("pthread_mutex_unlock metrics_mutex in print_metrics");
+    }
+
+    if (clock_gettime(CLOCK_MONOTONIC, &end_time_global) == -1) {
+        die("clock_gettime end_time_global");
+    }
+
+    uint64_t runtime_ns = diff_timespec_ns(&start_time_global, &end_time_global);
+    double runtime_sec  = (double)runtime_ns / 1e9;
+
+    double avg_latency_us = 0.0;
+    if (local_total_items > 0) {
+        avg_latency_us = ((double)local_total_latency_ns / (double)local_total_items) / 1000.0;
+    }
+
+    double throughput = 0.0;
+    if (runtime_sec > 0.0) {
+        throughput = (double)local_total_items / runtime_sec;
+    }
+
+    printf("\n=========== METRICS ===========\n");
+    printf("Total items consumed: %llu\n", (unsigned long long)local_total_items);
+    printf("Average latency: %.2f microseconds\n", avg_latency_us);
+    printf("Throughput: %.2f items/second\n", throughput);
+    printf("Runtime: %.3f seconds\n", runtime_sec);
 }
 
-
-int main(int argc, char *argv[]) {
-    if (argc < 4 || argc > 5) {
-        printf("Usage: %s <producers> <consumers> <buffer_size> [items_per_producer]\n",
-               argv[0]);
-        return 1;
+// Parses and validates command-line arguments
+static void parse_args(int argc, char *argv[])
+{
+    if (argc != 5) {
+        fprintf(stderr,
+                "Usage: %s <num_producers> <num_consumers> <buffer_size> <items_per_producer>\n",
+                argv[0]);
+        exit(EXIT_FAILURE);
     }
 
-    shared_t s;
+    NUM_PRODUCERS = atoi(argv[1]);
+    NUM_CONSUMERS = atoi(argv[2]);
+    BUFFER_SIZE   = atoi(argv[3]);
+    ITEMS_PER_PRODUCER = atoi(argv[4]);
 
-    s.producers = parse_int(argv[1], "num_producers");
-    s.consumers = parse_int(argv[2], "num_consumers");
-    s.size = parse_int(argv[3], "buffer_size");
-    s.items_per_producer = (argc == 5) ? parse_int(argv[4], "items_per_producer") : 20;
-
-    s.total_items = s.producers * s.items_per_producer;
-    s.consumed_items = 0;
-    s.total_latency_sec = 0.0;
-
-    s.buffer = (buffer_slot_t *)malloc(sizeof(buffer_slot_t) * s.size);
-    if (!s.buffer) {
-        perror("malloc");
-        return 1;
+    if (NUM_PRODUCERS <= 0 || NUM_CONSUMERS <= 0 ||
+        BUFFER_SIZE <= 0 || ITEMS_PER_PRODUCER <= 0) {
+        fprintf(stderr, "All arguments must be positive integers.\n");
+        exit(EXIT_FAILURE);
     }
 
-    s.in = 0;
-    s.out = 0;
+    if (BUFFER_SIZE < 2) {
+        fprintf(stderr, "Buffer size should be at least 2 for a meaningful test.\n");
+        exit(EXIT_FAILURE);
+    }
+}
 
-    if (pthread_mutex_init(&s.mutex, NULL) != 0) {
-        fprintf(stderr, "Error: failed to initialize buffer mutex\n");
-        return 1;
-    }
-    if (pthread_mutex_init(&s.stats_mutex, NULL) != 0) {
-        fprintf(stderr, "Error: failed to initialize stats mutex\n");
-        return 1;
-    }
-    if (pthread_cond_init(&s.all_items_consumed, NULL) != 0) {
-        fprintf(stderr, "Error: failed to initialize condition variable\n");
-        return 1;
+int main(int argc, char *argv[])
+{
+    parse_args(argc, argv);
+
+    // Allocates queues
+    urgent_queue = calloc(BUFFER_SIZE, sizeof(buffer_item_t));
+    normal_queue = calloc(BUFFER_SIZE, sizeof(buffer_item_t));
+    if (!urgent_queue || !normal_queue) {
+        die("calloc for queues");
     }
 
-    // Use named semaphores for macOS + Linux support
+    // Ensures old named semaphores are removed
     sem_unlink(EMPTY_SEM_NAME);
     sem_unlink(FULL_SEM_NAME);
 
-    s.empty_slots = sem_open(EMPTY_SEM_NAME, O_CREAT, 0644, s.size);
-    s.full_slots  = sem_open(FULL_SEM_NAME,  O_CREAT, 0644, 0);
-
-    if (s.empty_slots == SEM_FAILED) {
-        perror("sem_open empty_slots");
-        exit(1);
-    }
-    if (s.full_slots == SEM_FAILED) {
-        perror("sem_open full_slots");
-        exit(1);
+    // Creates named semaphores
+    sem_empty = sem_open(EMPTY_SEM_NAME, O_CREAT | O_EXCL, 0644, BUFFER_SIZE);
+    if (sem_empty == SEM_FAILED) {
+        die("sem_open sem_empty");
     }
 
-    pthread_t prod_threads[s.producers];
-    pthread_t cons_threads[s.consumers];
-    thread_arg_t prod_args[s.producers];
-    thread_arg_t cons_args[s.consumers];
+    sem_full = sem_open(FULL_SEM_NAME, O_CREAT | O_EXCL, 0644, 0);
+    if (sem_full == SEM_FAILED) {
+        die("sem_open sem_full");
+    }
 
-    srand((unsigned int)time(NULL));
+    // Main thread records start time just before creating worker threads
+    if (clock_gettime(CLOCK_MONOTONIC, &start_time_global) == -1) {
+        die("clock_gettime start_time_global");
+    }
 
-    // Record start time just before threads begin working
-    now(&s.start_time);
+    pthread_t *producers = calloc(NUM_PRODUCERS, sizeof(pthread_t));
+    pthread_t *consumers = calloc(NUM_CONSUMERS, sizeof(pthread_t));
+    thread_arg_t *prod_args = calloc(NUM_PRODUCERS, sizeof(thread_arg_t));
+    thread_arg_t *cons_args = calloc(NUM_CONSUMERS, sizeof(thread_arg_t));
 
-    // Create producer threads
-    for (int i = 0; i < s.producers; i++) {
-        prod_args[i].id = i + 1;
-        prod_args[i].shared = &s;
-        int rc = pthread_create(&prod_threads[i], NULL,
-                                producer_thread, &prod_args[i]);
+    if (!producers || !consumers || !prod_args || !cons_args) {
+        die("calloc for thread arrays");
+    }
+
+    // Creates consumer threads first (they can start waiting immediately)
+    for (int i = 0; i < NUM_CONSUMERS; ++i) {
+        cons_args[i].thread_id = i + 1;
+        int rc = pthread_create(&consumers[i], NULL, consumer_thread, &cons_args[i]);
         if (rc != 0) {
-            fprintf(stderr, "Error: pthread_create for producer %d failed (%d)\n",
-                    i + 1, rc);
-            exit(1);
+            fprintf(stderr, "Failed to create consumer thread %d: %s\n",
+                    i + 1, strerror(rc));
+            exit(EXIT_FAILURE);
         }
     }
 
-    // Create consumer threads
-    for (int i = 0; i < s.consumers; i++) {
-        cons_args[i].id = i + 1;
-        cons_args[i].shared = &s;
-        int rc = pthread_create(&cons_threads[i], NULL,
-                                consumer_thread, &cons_args[i]);
+    // Creates producer threads
+    for (int i = 0; i < NUM_PRODUCERS; ++i) {
+        prod_args[i].thread_id = i + 1;
+        int rc = pthread_create(&producers[i], NULL, producer_thread, &prod_args[i]);
         if (rc != 0) {
-            fprintf(stderr, "Error: pthread_create for consumer %d failed (%d)\n",
-                    i + 1, rc);
-            exit(1);
+            fprintf(stderr, "Failed to create producer thread %d: %s\n",
+                    i + 1, strerror(rc));
+            exit(EXIT_FAILURE);
         }
     }
 
-    // Wait for all producers to finish
-    for (int i = 0; i < s.producers; i++)
-        pthread_join(prod_threads[i], NULL);
-
-    // Wait until all real items have been consumed
-    pthread_mutex_lock(&s.stats_mutex);
-    while (s.consumed_items < s.total_items) {
-        pthread_cond_wait(&s.all_items_consumed, &s.stats_mutex);
-    }
-    pthread_mutex_unlock(&s.stats_mutex);
-
-    // Insert poison pills to signal consumer termination
-    for (int i = 0; i < s.consumers; i++) {
-        sem_wait(s.empty_slots);
-        pthread_mutex_lock(&s.mutex);
-
-        struct timeval poison_time;
-        now(&poison_time);
-
-        s.buffer[s.in].value = POISON_PILL;
-        s.buffer[s.in].enqueue_time = poison_time; // not used for stats
-        printf("[Main] Inserted POISON_PILL at index %d\n", s.in);
-        s.in = (s.in + 1) % s.size;
-
-        pthread_mutex_unlock(&s.mutex);
-        sem_post(s.full_slots);
+    // Waits for all producers to finish
+    for (int i = 0; i < NUM_PRODUCERS; ++i) {
+        pthread_join(producers[i], NULL);
     }
 
-    // Wait for all consumers to exit
-    for (int i = 0; i < s.consumers; i++)
-        pthread_join(cons_threads[i], NULL);
+    // Inserts one poison pill for each consumer so they can exit gracefully
+    insert_poison_pills();
 
-    // Record end time after all consumers finish
-    now(&s.end_time);
+    // Waits for all consumers to finish
+    for (int i = 0; i < NUM_CONSUMERS; ++i) {
+        pthread_join(consumers[i], NULL);
+    }
 
-    double runtime_sec = elapsed_sec(s.start_time, s.end_time);
-    double avg_latency_sec =
-        (s.consumed_items > 0) ? (s.total_latency_sec / s.consumed_items) : 0.0;
-    double throughput =
-        (runtime_sec > 0.0) ? ((double)s.consumed_items / runtime_sec) : 0.0;
+    // Prints collected metrics
+    print_metrics();
 
-    printf("\n=== Summary ===\n");
-    printf("Producers: %d, Consumers: %d, Buffer size: %d\n",
-           s.producers, s.consumers, s.size);
-    printf("Items per producer: %d\n", s.items_per_producer);
-    printf("Expected real items: %d\n", s.total_items);
-    printf("Consumed real items: %d\n", s.consumed_items);
-    printf("Total runtime: %.6f seconds\n", runtime_sec);
-    printf("Average latency per item: %.6f seconds\n", avg_latency_sec);
-    printf("Throughput: %.6f items/second\n", throughput);
+    // Cleans up resources
+    free(urgent_queue);
+    free(normal_queue);
+    free(producers);
+    free(consumers);
+    free(prod_args);
+    free(cons_args);
 
-    // Cleanup
-    pthread_mutex_destroy(&s.mutex);
-    pthread_mutex_destroy(&s.stats_mutex);
-    pthread_cond_destroy(&s.all_items_consumed);
+    if (sem_close(sem_empty) == -1) {
+        die("sem_close sem_empty");
+    }
+    if (sem_close(sem_full) == -1) {
+        die("sem_close sem_full");
+    }
 
-    sem_close(s.empty_slots);
-    sem_close(s.full_slots);
+    // The semaphores are unlinked here so that they do not persist after program exit
     sem_unlink(EMPTY_SEM_NAME);
     sem_unlink(FULL_SEM_NAME);
 
-    free(s.buffer);
+    pthread_mutex_destroy(&buffer_mutex);
+    pthread_mutex_destroy(&metrics_mutex);
 
     return 0;
 }
