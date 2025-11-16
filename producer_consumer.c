@@ -1,60 +1,57 @@
-// CMP-310 Mini Project (Fall 2025)
-// Producer–Consumer implementation using pthreads, semaphores, and a circular buffer.
+// CMP-310 Mini Project – Producer–Consumer (Fall 2025)
+// Multithreaded bounded buffer using POSIX threads, semaphores, and a mutex.
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <pthread.h>
 #include <semaphore.h>
-#include <unistd.h>
 #include <time.h>
 
 #define POISON_PILL -1
 
-// Shared structure holding the circular buffer and all synchronization objects
+// Shared structure holding buffer state and synchronization primitives
 typedef struct {
-    int *buffer;
-    int size;
-    int in;
-    int out;
+    int *buffer;            // Circular buffer storage
+    int size;               // Capacity of the buffer
+    int in;                 // Write index
+    int out;                // Read index
 
-    sem_t empty_slots;          // Counts available empty positions in the buffer
-    sem_t full_slots;           // Counts available filled positions
-    pthread_mutex_t mutex;      // Protects buffer access
+    sem_t empty_slots;      // Tracks remaining empty positions
+    sem_t full_slots;       // Tracks filled positions available for consumption
+    pthread_mutex_t mutex;  // Ensures mutual exclusion on buffer access
 
     int producers;
     int consumers;
     int items_per_producer;
 
-    int total_items;
-    int consumed_count;
-    pthread_mutex_t count_mutex;
-
+    int total_items;        // Expected number of real items
+    int consumed_items;     // Counter of consumed real items
+    pthread_mutex_t count_mutex;  // Protects consumed_items
 } shared_t;
 
-// Thread argument containing the ID and reference to shared memory
 typedef struct {
-    int id;
-    shared_t *shared;
+    int id;                 // Thread ID for logging
+    shared_t *shared;       // Pointer to shared state
 } thread_arg_t;
 
 
-// Producer thread: generates items and inserts them into the buffer
-void *producer(void *arg) {
+// Producer: generates items and inserts them into the circular buffer
+void *producer_thread(void *arg) {
     thread_arg_t *t = arg;
     shared_t *s = t->shared;
 
     for (int i = 0; i < s->items_per_producer; i++) {
         int item = rand() % 1000;
 
-        sem_wait(&s->empty_slots);
-        pthread_mutex_lock(&s->mutex);
+        sem_wait(&s->empty_slots);          // Blocks if buffer is full
+        pthread_mutex_lock(&s->mutex);      // Exclusive access to buffer
 
         s->buffer[s->in] = item;
-        printf("[Producer-%d] Produced %d at %d\n", t->id, item, s->in);
+        printf("[Producer-%d] Produced %d at index %d\n", t->id, item, s->in);
         s->in = (s->in + 1) % s->size;
 
         pthread_mutex_unlock(&s->mutex);
-        sem_post(&s->full_slots);
+        sem_post(&s->full_slots);           // Signals a new filled slot
     }
 
     printf("[Producer-%d] Finished producing.\n", t->id);
@@ -62,41 +59,43 @@ void *producer(void *arg) {
 }
 
 
-// Consumer thread: removes and processes items from the buffer
-void *consumer(void *arg) {
+// Consumer: removes items from the circular buffer and processes them
+void *consumer_thread(void *arg) {
     thread_arg_t *t = arg;
     shared_t *s = t->shared;
 
     while (1) {
-        sem_wait(&s->full_slots);
-        pthread_mutex_lock(&s->mutex);
+        sem_wait(&s->full_slots);          // Blocks if buffer is empty
+        pthread_mutex_lock(&s->mutex);     // Exclusive access to buffer
 
         int item = s->buffer[s->out];
-        printf("[Consumer-%d] Dequeued %d from %d\n", t->id, item, s->out);
+        printf("[Consumer-%d] Dequeued %d from index %d\n", t->id, item, s->out);
         s->out = (s->out + 1) % s->size;
 
         pthread_mutex_unlock(&s->mutex);
-        sem_post(&s->empty_slots);
+        sem_post(&s->empty_slots);         // Signals a newly freed slot
 
-        if (item == POISON_PILL) {
+        if (item == POISON_PILL) {         // Poison pill triggers termination
             printf("[Consumer-%d] Exiting.\n", t->id);
             break;
         }
 
         pthread_mutex_lock(&s->count_mutex);
-        s->consumed_count++;
+        s->consumed_items++;
         pthread_mutex_unlock(&s->count_mutex);
+
+        printf("[Consumer-%d] Consumed real item %d\n", t->id, item);
     }
 
     return NULL;
 }
 
 
-// Converts command-line argument to a positive integer
-int parse_int(char *s) {
-    int x = atoi(s);
+// Validates and converts command-line arguments
+int parse_int(char *arg) {
+    int x = atoi(arg);
     if (x <= 0) {
-        fprintf(stderr, "Invalid argument: %s\n", s);
+        fprintf(stderr, "Invalid argument: %s\n", arg);
         exit(1);
     }
     return x;
@@ -116,15 +115,14 @@ int main(int argc, char *argv[]) {
     s.size = parse_int(argv[3]);
     s.items_per_producer = (argc == 5) ? parse_int(argv[4]) : 20;
 
-    s.total_items = s.items_per_producer * s.producers;
-    s.consumed_count = 0;
+    s.total_items = s.producers * s.items_per_producer;
+    s.consumed_items = 0;
 
     s.buffer = malloc(sizeof(int) * s.size);
     s.in = s.out = 0;
 
     pthread_mutex_init(&s.mutex, NULL);
     pthread_mutex_init(&s.count_mutex, NULL);
-
     sem_init(&s.empty_slots, 0, s.size);
     sem_init(&s.full_slots, 0, 0);
 
@@ -138,25 +136,26 @@ int main(int argc, char *argv[]) {
     for (int i = 0; i < s.producers; i++) {
         prod_args[i].id = i + 1;
         prod_args[i].shared = &s;
-        pthread_create(&prod_threads[i], NULL, producer, &prod_args[i]);
+        pthread_create(&prod_threads[i], NULL, producer_thread, &prod_args[i]);
     }
 
     for (int i = 0; i < s.consumers; i++) {
         cons_args[i].id = i + 1;
         cons_args[i].shared = &s;
-        pthread_create(&cons_threads[i], NULL, consumer, &cons_args[i]);
+        pthread_create(&cons_threads[i], NULL, consumer_thread, &cons_args[i]);
     }
 
     for (int i = 0; i < s.producers; i++)
         pthread_join(prod_threads[i], NULL);
 
-    // Inserts poison pills equal to the number of consumers
+    // Insert poison pills to signal consumer termination
     for (int i = 0; i < s.consumers; i++) {
         sem_wait(&s.empty_slots);
         pthread_mutex_lock(&s.mutex);
 
-        s->buffer[s->in] = POISON_PILL;
-        s->in = (s.in + 1) % s.size;
+        s.buffer[s.in] = POISON_PILL;
+        printf("[Main] Inserted POISON_PILL at index %d\n", s.in);
+        s.in = (s.in + 1) % s.size;
 
         pthread_mutex_unlock(&s.mutex);
         sem_post(&s.full_slots);
@@ -165,7 +164,7 @@ int main(int argc, char *argv[]) {
     for (int i = 0; i < s.consumers; i++)
         pthread_join(cons_threads[i], NULL);
 
-    printf("Summary: expected = %d, consumed = %d\n", s.total_items, s.consumed_count);
+    printf("Summary: expected=%d, consumed=%d\n", s.total_items, s.consumed_items);
 
     return 0;
 }
