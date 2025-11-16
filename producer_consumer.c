@@ -1,5 +1,6 @@
 // CMP-310 Mini Project – Producer–Consumer (Fall 2025)
 // Multithreaded bounded buffer using pthreads, semaphores, and a mutex.
+// Compatible with macOS (uses named semaphores) and Linux.
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -7,8 +8,15 @@
 #include <semaphore.h>
 #include <time.h>
 #include <sys/time.h>
+#include <fcntl.h>     // For O_CREAT, O_EXCL
+#include <sys/stat.h>  // For mode constants
+#include <unistd.h>
 
 #define POISON_PILL -1
+
+// Names for POSIX named semaphores
+#define EMPTY_SEM_NAME "/cmp310_empty_slots"
+#define FULL_SEM_NAME  "/cmp310_full_slots"
 
 // Each buffer slot stores a value and its enqueue time
 typedef struct {
@@ -23,8 +31,10 @@ typedef struct {
     int in;                  // Write index
     int out;                 // Read index
 
-    sem_t empty_slots;       // Tracks remaining empty positions
-    sem_t full_slots;        // Tracks filled positions available for consumption
+    // Named semaphores (pointers)
+    sem_t *empty_slots;      // Tracks remaining empty positions
+    sem_t *full_slots;       // Tracks filled positions available for consumption
+
     pthread_mutex_t mutex;   // Ensures mutual exclusion on buffer access
 
     int producers;
@@ -62,8 +72,8 @@ void *producer_thread(void *arg) {
     for (int i = 0; i < s->items_per_producer; i++) {
         int item = rand() % 1000;
 
-        sem_wait(&s->empty_slots);          // Blocks if buffer is full
-        pthread_mutex_lock(&s->mutex);      // Exclusive access to buffer
+        sem_wait(s->empty_slots);          // Blocks if buffer is full
+        pthread_mutex_lock(&s->mutex);     // Exclusive access to buffer
 
         struct timeval enq_time;
         now(&enq_time);
@@ -76,7 +86,7 @@ void *producer_thread(void *arg) {
         s->in = (s->in + 1) % s->size;
 
         pthread_mutex_unlock(&s->mutex);
-        sem_post(&s->full_slots);           // Signals a new filled slot
+        sem_post(s->full_slots);           // Signals a new filled slot
     }
 
     printf("[Producer-%d] Finished producing.\n", t->id);
@@ -90,7 +100,7 @@ void *consumer_thread(void *arg) {
     shared_t *s = t->shared;
 
     while (1) {
-        sem_wait(&s->full_slots);          // Blocks if buffer is empty
+        sem_wait(s->full_slots);           // Blocks if buffer is empty
         pthread_mutex_lock(&s->mutex);     // Exclusive access to buffer
 
         buffer_slot_t slot = s->buffer[s->out];
@@ -101,7 +111,7 @@ void *consumer_thread(void *arg) {
         s->out = (s->out + 1) % s->size;
 
         pthread_mutex_unlock(&s->mutex);
-        sem_post(&s->empty_slots);         // Signals a newly freed slot
+        sem_post(s->empty_slots);          // Signals a newly freed slot
 
         if (slot.value == POISON_PILL) {   // Poison pill triggers termination
             printf("[Consumer-%d] Exiting.\n", t->id);
@@ -192,13 +202,21 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Error: failed to initialize condition variable\n");
         return 1;
     }
-    if (sem_init(&s.empty_slots, 0, s.size) != 0) {
-        fprintf(stderr, "Error: failed to initialize empty_slots semaphore\n");
-        return 1;
+
+    // Use named semaphores for macOS + Linux support
+    sem_unlink(EMPTY_SEM_NAME);
+    sem_unlink(FULL_SEM_NAME);
+
+    s.empty_slots = sem_open(EMPTY_SEM_NAME, O_CREAT, 0644, s.size);
+    s.full_slots  = sem_open(FULL_SEM_NAME,  O_CREAT, 0644, 0);
+
+    if (s.empty_slots == SEM_FAILED) {
+        perror("sem_open empty_slots");
+        exit(1);
     }
-    if (sem_init(&s.full_slots, 0, 0) != 0) {
-        fprintf(stderr, "Error: failed to initialize full_slots semaphore\n");
-        return 1;
+    if (s.full_slots == SEM_FAILED) {
+        perror("sem_open full_slots");
+        exit(1);
     }
 
     pthread_t prod_threads[s.producers];
@@ -211,6 +229,7 @@ int main(int argc, char *argv[]) {
     // Record start time just before threads begin working
     now(&s.start_time);
 
+    // Create producer threads
     for (int i = 0; i < s.producers; i++) {
         prod_args[i].id = i + 1;
         prod_args[i].shared = &s;
@@ -223,6 +242,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    // Create consumer threads
     for (int i = 0; i < s.consumers; i++) {
         cons_args[i].id = i + 1;
         cons_args[i].shared = &s;
@@ -235,6 +255,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    // Wait for all producers to finish
     for (int i = 0; i < s.producers; i++)
         pthread_join(prod_threads[i], NULL);
 
@@ -247,7 +268,7 @@ int main(int argc, char *argv[]) {
 
     // Insert poison pills to signal consumer termination
     for (int i = 0; i < s.consumers; i++) {
-        sem_wait(&s.empty_slots);
+        sem_wait(s.empty_slots);
         pthread_mutex_lock(&s.mutex);
 
         struct timeval poison_time;
@@ -259,9 +280,10 @@ int main(int argc, char *argv[]) {
         s.in = (s.in + 1) % s.size;
 
         pthread_mutex_unlock(&s.mutex);
-        sem_post(&s.full_slots);
+        sem_post(s.full_slots);
     }
 
+    // Wait for all consumers to exit
     for (int i = 0; i < s.consumers; i++)
         pthread_join(cons_threads[i], NULL);
 
@@ -284,12 +306,16 @@ int main(int argc, char *argv[]) {
     printf("Average latency per item: %.6f seconds\n", avg_latency_sec);
     printf("Throughput: %.6f items/second\n", throughput);
 
-    // (Optional) destroy synchronization primitives
+    // Cleanup
     pthread_mutex_destroy(&s.mutex);
     pthread_mutex_destroy(&s.stats_mutex);
     pthread_cond_destroy(&s.all_items_consumed);
-    sem_destroy(&s.empty_slots);
-    sem_destroy(&s.full_slots);
+
+    sem_close(s.empty_slots);
+    sem_close(s.full_slots);
+    sem_unlink(EMPTY_SEM_NAME);
+    sem_unlink(FULL_SEM_NAME);
+
     free(s.buffer);
 
     return 0;
