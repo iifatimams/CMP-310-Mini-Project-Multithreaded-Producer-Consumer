@@ -1,5 +1,9 @@
 // producer_consumer.c
 // -----------------------------------------------------------------------------
+// Multithreaded Producer–Consumer with priority queues, named semaphores,
+// mutex-based synchronization, poison-pill termination, and latency/throughput
+// metrics.
+// -----------------------------------------------------------------------------
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -37,7 +41,7 @@ typedef struct {
     int value;                  // The integer payload
     int priority;               // 0 = normal, 1 = urgent
     int is_poison;              // 1 if this is a poison pill, 0 otherwise
-    struct timespec enq_time;   // Timestamp when producer enqueues the item
+    struct timespec enq_time;   // Timestamp when producer starts enqueue op
 } buffer_item_t;
 
 // Global configuration parameters
@@ -94,7 +98,7 @@ static void die(const char *msg)
 // Function that enqueues an item into the appropriate priority queue
 static void enqueue_item(const buffer_item_t *item)
 {
-    // The caller already holds buffer_mutex and has decremented sem_empty.
+    // The caller already holds buffer_mutex and has reserved a slot via sem_empty.
     if (item->priority == PRIORITY_URGENT && !item->is_poison) {
         // Inserts into urgent queue
         urgent_queue[urgent_tail] = *item;
@@ -152,14 +156,15 @@ void *producer_thread(void *arg)
             item.priority = PRIORITY_NORMAL;
         }
 
-        // Waits for an empty slot in the buffer
-        if (sem_wait(sem_empty) == -1) {
-            die("sem_wait(sem_empty) in producer");
-        }
-
-        // Records enqueue time as soon as an empty slot is reserved
+        // Record enqueue time when the producer starts the enqueue operation.
+        // This includes any waiting time if the buffer is full.
         if (clock_gettime(CLOCK_MONOTONIC, &item.enq_time) == -1) {
             die("clock_gettime in producer");
+        }
+
+        // Waits for an empty slot in the buffer (may block when full)
+        if (sem_wait(sem_empty) == -1) {
+            die("sem_wait(sem_empty) in producer");
         }
 
         // Inserts the item into the appropriate queue
@@ -317,7 +322,6 @@ static void print_metrics(void)
         throughput = (double)local_total_items / runtime_sec;
     }
 
-    // EXACT format you requested:
     printf("\n========== METRICS ==========\n");
     printf("Total items consumed: %llu\n",
            (unsigned long long)local_total_items);
