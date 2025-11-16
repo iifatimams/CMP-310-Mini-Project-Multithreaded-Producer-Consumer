@@ -317,7 +317,8 @@ static void print_metrics(void)
         throughput = (double)local_total_items / runtime_sec;
     }
 
-    printf("\n=========== METRICS ============\n");
+    // EXACT format you requested:
+    printf("\n========== METRICS ==========\n");
     printf("Total items consumed: %llu\n",
            (unsigned long long)local_total_items);
     printf("Average latency: %.2f microseconds\n", avg_latency_us);
