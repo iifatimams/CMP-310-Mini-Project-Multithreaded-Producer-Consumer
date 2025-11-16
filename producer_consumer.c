@@ -37,6 +37,7 @@ typedef struct {
     double total_latency_sec; // Sum of per-item latency in seconds
 
     pthread_mutex_t stats_mutex; // Protects consumed_items and total_latency_sec
+    pthread_cond_t  all_items_consumed; // Signaled when all real items consumed
 
     struct timeval start_time; // Time when program started work
     struct timeval end_time;   // Time when all consumers finished
@@ -118,6 +119,12 @@ void *consumer_thread(void *arg) {
         pthread_mutex_lock(&s->stats_mutex);
         s->consumed_items++;
         s->total_latency_sec += latency;
+
+        // If this was the last real item, wake up main thread
+        if (s->consumed_items == s->total_items) {
+            pthread_cond_signal(&s->all_items_consumed);
+        }
+
         pthread_mutex_unlock(&s->stats_mutex);
 
         printf("[Consumer-%d] Consumed real item %d (latency ≈ %.6f s)\n",
@@ -173,10 +180,26 @@ int main(int argc, char *argv[]) {
     s.in = 0;
     s.out = 0;
 
-    pthread_mutex_init(&s.mutex, NULL);
-    pthread_mutex_init(&s.stats_mutex, NULL);
-    sem_init(&s.empty_slots, 0, s.size);
-    sem_init(&s.full_slots, 0, 0);
+    if (pthread_mutex_init(&s.mutex, NULL) != 0) {
+        fprintf(stderr, "Error: failed to initialize buffer mutex\n");
+        return 1;
+    }
+    if (pthread_mutex_init(&s.stats_mutex, NULL) != 0) {
+        fprintf(stderr, "Error: failed to initialize stats mutex\n");
+        return 1;
+    }
+    if (pthread_cond_init(&s.all_items_consumed, NULL) != 0) {
+        fprintf(stderr, "Error: failed to initialize condition variable\n");
+        return 1;
+    }
+    if (sem_init(&s.empty_slots, 0, s.size) != 0) {
+        fprintf(stderr, "Error: failed to initialize empty_slots semaphore\n");
+        return 1;
+    }
+    if (sem_init(&s.full_slots, 0, 0) != 0) {
+        fprintf(stderr, "Error: failed to initialize full_slots semaphore\n");
+        return 1;
+    }
 
     pthread_t prod_threads[s.producers];
     pthread_t cons_threads[s.consumers];
@@ -191,17 +214,36 @@ int main(int argc, char *argv[]) {
     for (int i = 0; i < s.producers; i++) {
         prod_args[i].id = i + 1;
         prod_args[i].shared = &s;
-        pthread_create(&prod_threads[i], NULL, producer_thread, &prod_args[i]);
+        int rc = pthread_create(&prod_threads[i], NULL,
+                                producer_thread, &prod_args[i]);
+        if (rc != 0) {
+            fprintf(stderr, "Error: pthread_create for producer %d failed (%d)\n",
+                    i + 1, rc);
+            exit(1);
+        }
     }
 
     for (int i = 0; i < s.consumers; i++) {
         cons_args[i].id = i + 1;
         cons_args[i].shared = &s;
-        pthread_create(&cons_threads[i], NULL, consumer_thread, &cons_args[i]);
+        int rc = pthread_create(&cons_threads[i], NULL,
+                                consumer_thread, &cons_args[i]);
+        if (rc != 0) {
+            fprintf(stderr, "Error: pthread_create for consumer %d failed (%d)\n",
+                    i + 1, rc);
+            exit(1);
+        }
     }
 
     for (int i = 0; i < s.producers; i++)
         pthread_join(prod_threads[i], NULL);
+
+    // Wait until all real items have been consumed
+    pthread_mutex_lock(&s.stats_mutex);
+    while (s.consumed_items < s.total_items) {
+        pthread_cond_wait(&s.all_items_consumed, &s.stats_mutex);
+    }
+    pthread_mutex_unlock(&s.stats_mutex);
 
     // Insert poison pills to signal consumer termination
     for (int i = 0; i < s.consumers; i++) {
@@ -241,6 +283,14 @@ int main(int argc, char *argv[]) {
     printf("Total runtime: %.6f seconds\n", runtime_sec);
     printf("Average latency per item: %.6f seconds\n", avg_latency_sec);
     printf("Throughput: %.6f items/second\n", throughput);
+
+    // (Optional) destroy synchronization primitives
+    pthread_mutex_destroy(&s.mutex);
+    pthread_mutex_destroy(&s.stats_mutex);
+    pthread_cond_destroy(&s.all_items_consumed);
+    sem_destroy(&s.empty_slots);
+    sem_destroy(&s.full_slots);
+    free(s.buffer);
 
     return 0;
 }
