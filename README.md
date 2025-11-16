@@ -55,14 +55,14 @@ The program requires three command-line arguments:
 
 **Expected Outcome:**
 
-- Producers will frequently block on `sem_empty` because the buffer is always full.
-- Consumers will frequently block on `sem_full` during timing gaps.
-- Throughput will be lower because of heavy synchronization.
-- Average latency will be higher due to longer waiting times.
+- Producers frequently block on `sem_empty` due to the buffer quickly reaching full capacity.
+- Consumers occasionally block on `sem_full` depending on timing gaps between production and consumption.
+- Heavy synchronization causes increased contention and reduced throughput.
+- Latency is relatively low because items are consumed shortly after being produced due to continuous backpressure.
 - METRICS block should show:
-  - Higher latency (hundreds–thousands of microseconds)
-  - Lower throughput (compared to large buffer test)
   - Total items consumed = 4 × 20 = 80
+  - Average latency in the tens of microseconds (e.g., 30–50 µs typical)
+  - Throughput in the tens of thousands of items/second
 
 ---
 
@@ -74,13 +74,14 @@ The program requires three command-line arguments:
 
 **Expected Outcome:**
 
-- Producers rarely block since the buffer has enough space.
-- Consumers dequeue smoothly with minimal waiting.
-- Throughput will be significantly higher than Test 1.
-- Latency will be lower because items are not stuck waiting in queues.
+- Producers rarely block, as the buffer has ample space.
+- Consumers dequeue smoothly with minimal blocking on `sem_full`.
+- Producers may run ahead of consumers, allowing items to accumulate in the buffer.
+- Latency increases slightly since items may remain in the buffer longer before consumption.
 - METRICS block should show:
-  - Lower latency (tens–hundreds of microseconds)
   - Total items consumed = 80
+  - Average latency in the hundreds of microseconds (e.g., 500–700 µs typical)
+  - Throughput comparable to or slightly higher than Test 1
 
 ---
 
@@ -92,29 +93,31 @@ The program requires three command-line arguments:
 
 **Expected Outcome:**
 
-- Lines containing `(priority: urgent)` will appear in consumer output before any pending normal priority items.
-- FIFO order is preserved inside each priority queue.
-- Normal items are not consumed while any urgent items remain.
-- Total urgent item percentage should be at least 25%.
+- Urgent items (marked with `(priority: urgent)`) are always consumed before any normal items.
+- FIFO order is preserved within each priority class.
+- Normal items are not consumed until all urgent items have been handled.
+- At least 25% of items are urgent, as enforced by producer logic.
+- Output will reflect urgent items being processed ahead of earlier-produced normal items.
 
 ---
 
 ### Test 4: Graceful Termination (Poison Pill)
 
-Any run configuration can be used.  
-A correct termination must include:
+Any valid run configuration can be used.
+
+A correct termination must include, for every consumer:
 
 ```csharp
 [Consumer-X] Finished consuming.
 ```
 
-for each consumer thread.
-
 **Expected Outcome:**
 
-- No hanging, deadlocks, or infinite waiting.
-- Each consumer terminates only after receiving one poison pill.
-- Final METRICS block must appear once at the end.
+- No deadlocks, hangs, or infinite waiting.
+- Each consumer thread exits only after receiving exactly one poison pill.
+- Final METRICS block is printed once, after all threads have completed.
+- Confirms proper resource cleanup and termination logic.
+
 
 ---
 
