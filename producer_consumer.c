@@ -1,8 +1,6 @@
 // producer_consumer.c
 // -----------------------------------------------------------------------------
 
-
-
 #define _POSIX_C_SOURCE 200809L
 
 #include <stdio.h>
@@ -17,7 +15,7 @@
 #include <stdint.h>
 #include <unistd.h>
 
-// Named semaphore identifiers
+// Named semaphore identifiers (must be unique system-wide)
 #define EMPTY_SEM_NAME "/pc_empty_sem_example"
 #define FULL_SEM_NAME  "/pc_full_sem_example"
 
@@ -31,6 +29,9 @@
 // Special poison-pill marker
 #define POISON_VALUE   -1
 
+// Fixed number of items produced by each producer
+int ITEMS_PER_PRODUCER = 20;
+
 // Structure that represents a single item in the buffer
 typedef struct {
     int value;                  // The integer payload
@@ -43,7 +44,6 @@ typedef struct {
 int NUM_PRODUCERS = 0;
 int NUM_CONSUMERS = 0;
 int BUFFER_SIZE   = 0;
-int ITEMS_PER_PRODUCER = 0;
 
 // Global shared queues for priorities (each is circular)
 buffer_item_t *urgent_queue  = NULL;
@@ -84,7 +84,7 @@ static uint64_t diff_timespec_ns(const struct timespec *start,
     return (uint64_t)sec * 1000000000ULL + (uint64_t)nsec;
 }
 
-// Utility: safe exit with message
+// Utility: prints error from errno and exits
 static void die(const char *msg)
 {
     perror(msg);
@@ -94,7 +94,7 @@ static void die(const char *msg)
 // Function that enqueues an item into the appropriate priority queue
 static void enqueue_item(const buffer_item_t *item)
 {
-    // The caller already holds buffer_mutex and has decremented sem_empty
+    // The caller already holds buffer_mutex and has decremented sem_empty.
     if (item->priority == PRIORITY_URGENT && !item->is_poison) {
         // Inserts into urgent queue
         urgent_queue[urgent_tail] = *item;
@@ -113,7 +113,7 @@ static buffer_item_t dequeue_item(void)
 {
     buffer_item_t item;
 
-    // The caller already holds buffer_mutex and has decremented sem_full
+    // The caller already holds buffer_mutex and has decremented sem_full.
     if (urgent_count > 0) {
         // Consumer takes from urgent queue first
         item = urgent_queue[urgent_head];
@@ -308,7 +308,8 @@ static void print_metrics(void)
 
     double avg_latency_us = 0.0;
     if (local_total_items > 0) {
-        avg_latency_us = ((double)local_total_latency_ns / (double)local_total_items) / 1000.0;
+        avg_latency_us = ((double)local_total_latency_ns /
+                          (double)local_total_items) / 1000.0;
     }
 
     double throughput = 0.0;
@@ -316,8 +317,9 @@ static void print_metrics(void)
         throughput = (double)local_total_items / runtime_sec;
     }
 
-    printf("\n=========== METRICS ===========\n");
-    printf("Total items consumed: %llu\n", (unsigned long long)local_total_items);
+    printf("\n=========== METRICS ============\n");
+    printf("Total items consumed: %llu\n",
+           (unsigned long long)local_total_items);
     printf("Average latency: %.2f microseconds\n", avg_latency_us);
     printf("Throughput: %.2f items/second\n", throughput);
     printf("Runtime: %.3f seconds\n", runtime_sec);
@@ -326,9 +328,9 @@ static void print_metrics(void)
 // Parses and validates command-line arguments
 static void parse_args(int argc, char *argv[])
 {
-    if (argc != 5) {
+    if (argc != 4) {
         fprintf(stderr,
-                "Usage: %s <num_producers> <num_consumers> <buffer_size> <items_per_producer>\n",
+                "Usage: %s <num_producers> <num_consumers> <buffer_size>\n",
                 argv[0]);
         exit(EXIT_FAILURE);
     }
@@ -336,10 +338,8 @@ static void parse_args(int argc, char *argv[])
     NUM_PRODUCERS = atoi(argv[1]);
     NUM_CONSUMERS = atoi(argv[2]);
     BUFFER_SIZE   = atoi(argv[3]);
-    ITEMS_PER_PRODUCER = atoi(argv[4]);
 
-    if (NUM_PRODUCERS <= 0 || NUM_CONSUMERS <= 0 ||
-        BUFFER_SIZE <= 0 || ITEMS_PER_PRODUCER <= 0) {
+    if (NUM_PRODUCERS <= 0 || NUM_CONSUMERS <= 0 || BUFFER_SIZE <= 0) {
         fprintf(stderr, "All arguments must be positive integers.\n");
         exit(EXIT_FAILURE);
     }
@@ -381,8 +381,8 @@ int main(int argc, char *argv[])
         die("clock_gettime start_time_global");
     }
 
-    pthread_t *producers = calloc(NUM_PRODUCERS, sizeof(pthread_t));
-    pthread_t *consumers = calloc(NUM_CONSUMERS, sizeof(pthread_t));
+    pthread_t *producers  = calloc(NUM_PRODUCERS, sizeof(pthread_t));
+    pthread_t *consumers  = calloc(NUM_CONSUMERS, sizeof(pthread_t));
     thread_arg_t *prod_args = calloc(NUM_PRODUCERS, sizeof(thread_arg_t));
     thread_arg_t *cons_args = calloc(NUM_CONSUMERS, sizeof(thread_arg_t));
 
